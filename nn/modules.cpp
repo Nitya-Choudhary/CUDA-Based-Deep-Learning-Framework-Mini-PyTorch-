@@ -5,11 +5,11 @@
 
 namespace minidl {
 
-Linear::Linear(int input_size, int output_size, DeviceType device, bool bias)
-    : weight({input_size, output_size}, device, true), bias({1, output_size}, device, true), has_bias(bias) {
+Linear::Linear(int input_size, int output_size, DeviceType device, bool use_bias)
+    : weight({input_size, output_size}, device, true), bias({1, output_size}, device, true), has_bias(use_bias) {
     weight = Tensor::randn({input_size, output_size}, device, true) * 0.01f;
     if (has_bias) {
-        bias = Tensor::zeros({1, output_size}, device, true);
+        this->bias = Tensor::zeros({1, output_size}, device, true);
     }
 }
 

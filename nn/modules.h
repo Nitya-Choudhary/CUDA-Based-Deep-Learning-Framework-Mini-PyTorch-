@@ -19,6 +19,7 @@ public:
     Linear(int input_size, int output_size, DeviceType device = DeviceType::CPU, bool bias = true);
     Tensor forward(const Tensor& x) override;
     std::vector<Tensor*> parameters() override;
+    void zero_grad() override;
     Tensor weight;
     Tensor bias;
     bool has_bias;

@@ -1,4 +1,4 @@
-#include "tensor/tensor.h"
+﻿#include "tensor/tensor.h"
 #include "cuda/cuda_utils.h"
 #include <cuda_runtime.h>
 #include <cassert>
@@ -8,15 +8,11 @@
 #include <iomanip>
 #include <iostream>
 #include <random>
+#include <sstream>
+#include <limits>
+#include <algorithm>
 
 namespace minidl {
-
-static void check_cuda(cudaError_t result) {
-    if (result != cudaSuccess) {
-        std::cerr << "CUDA Error: " << cudaGetErrorString(result) << std::endl;
-        std::exit(EXIT_FAILURE);
-    }
-}
 
 Tensor::Tensor() = default;
 
@@ -25,6 +21,9 @@ Tensor::Tensor(const std::vector<int>& shape, DeviceType device, bool requires_g
     numel_ = compute_numel(shape_);
     compute_strides();
     allocate_storage();
+    if (requires_grad_) {
+        grad_ = std::make_shared<Tensor>(zeros(shape_, device_, false));
+    }
 }
 
 Tensor::Tensor(const std::vector<int>& shape, float value, DeviceType device, bool requires_grad)
@@ -39,7 +38,7 @@ Tensor::Tensor(const std::vector<int>& shape, float value, DeviceType device, bo
         for (size_t i = 0; i < numel_; ++i) {
             cpu_value.data_.get()[i] = value;
         }
-        check_cuda(cudaMemcpy(data_.get(), cpu_value.data_.get(), numel_ * sizeof(float), cudaMemcpyHostToDevice));
+        cuda_ops::check_cuda(cudaMemcpy(data_.get(), cpu_value.data_.get(), numel_ * sizeof(float), cudaMemcpyHostToDevice));
     }
 }
 
@@ -59,7 +58,7 @@ Tensor Tensor::ones(const std::vector<int>& shape, DeviceType device, bool requi
         for (size_t i = 0; i < cpu_data.numel_; ++i) {
             cpu_data.data_.get()[i] = 1.0f;
         }
-        check_cuda(cudaMemcpy(result.data_.get(), cpu_data.data_.get(), result.numel_ * sizeof(float), cudaMemcpyHostToDevice));
+        cuda_ops::check_cuda(cudaMemcpy(result.data_.get(), cpu_data.data_.get(), result.numel_ * sizeof(float), cudaMemcpyHostToDevice));
     }
     return result;
 }
@@ -74,6 +73,9 @@ Tensor Tensor::randn(const std::vector<int>& shape, DeviceType device, bool requ
     if (device == DeviceType::CUDA) {
         result = result.to(DeviceType::CUDA);
         result.requires_grad_ = requires_grad;
+        if (requires_grad_) {
+            result.grad_ = std::make_shared<Tensor>(zeros(shape, device, false));
+        }
     }
     return result;
 }
@@ -86,7 +88,7 @@ Tensor Tensor::fromVector(const std::vector<float>& data, const std::vector<int>
     } else {
         Tensor cpu_data = Tensor::zeros(shape, DeviceType::CPU);
         std::memcpy(cpu_data.data_.get(), data.data(), data.size() * sizeof(float));
-        check_cuda(cudaMemcpy(result.data_.get(), cpu_data.data_.get(), data.size() * sizeof(float), cudaMemcpyHostToDevice));
+        cuda_ops::check_cuda(cudaMemcpy(result.data_.get(), cpu_data.data_.get(), data.size() * sizeof(float), cudaMemcpyHostToDevice));
     }
     return result;
 }
@@ -101,15 +103,15 @@ void Tensor::allocate_storage() {
         std::memset(data_.get(), 0, numel_ * sizeof(float));
     } else {
         float* device_ptr = nullptr;
-        check_cuda(cudaMalloc(&device_ptr, numel_ * sizeof(float)));
-        check_cuda(cudaMemset(device_ptr, 0, numel_ * sizeof(float)));
+        cuda_ops::check_cuda(cudaMalloc(&device_ptr, numel_ * sizeof(float)));
+        cuda_ops::check_cuda(cudaMemset(device_ptr, 0, numel_ * sizeof(float)));
         data_ = std::shared_ptr<float>(device_ptr, [](float* ptr) { cudaFree(ptr); });
     }
 }
 
 void Tensor::compute_strides() {
     strides_.assign(shape_.size(), 1);
-    for (int i = (int)shape_.size() - 2; i >= 0; --i) {
+    for (int i = static_cast<int>(shape_.size()) - 2; i >= 0; --i) {
         strides_[i] = strides_[i + 1] * shape_[i + 1];
     }
 }
@@ -129,15 +131,15 @@ Tensor Tensor::to(DeviceType device) const {
             if (device == DeviceType::CPU) {
                 std::memcpy(result.data_.get(), data_.get(), numel_ * sizeof(float));
             } else {
-                check_cuda(cudaMemcpy(result.data_.get(), data_.get(), numel_ * sizeof(float), cudaMemcpyDeviceToDevice));
+                cuda_ops::check_cuda(cudaMemcpy(result.data_.get(), data_.get(), numel_ * sizeof(float), cudaMemcpyDeviceToDevice));
             }
         }
         return result;
     }
     if (device_ == DeviceType::CPU && device == DeviceType::CUDA) {
-        check_cuda(cudaMemcpy(result.data_.get(), data_.get(), numel_ * sizeof(float), cudaMemcpyHostToDevice));
+        cuda_ops::check_cuda(cudaMemcpy(result.data_.get(), data_.get(), numel_ * sizeof(float), cudaMemcpyHostToDevice));
     } else if (device_ == DeviceType::CUDA && device == DeviceType::CPU) {
-        check_cuda(cudaMemcpy(result.data_.get(), data_.get(), numel_ * sizeof(float), cudaMemcpyDeviceToHost));
+        cuda_ops::check_cuda(cudaMemcpy(result.data_.get(), data_.get(), numel_ * sizeof(float), cudaMemcpyDeviceToHost));
     }
     return result;
 }
@@ -148,7 +150,7 @@ void Tensor::copy_from(const Tensor& source) {
         if (device_ == DeviceType::CPU) {
             std::memcpy(data_.get(), source.data_.get(), numel_ * sizeof(float));
         } else {
-            check_cuda(cudaMemcpy(data_.get(), source.data_.get(), numel_ * sizeof(float), cudaMemcpyDeviceToDevice));
+            cuda_ops::check_cuda(cudaMemcpy(data_.get(), source.data_.get(), numel_ * sizeof(float), cudaMemcpyDeviceToDevice));
         }
     } else {
         Tensor temp = source.to(device_);
@@ -178,7 +180,7 @@ float Tensor::at(const std::vector<int>& indices) const {
         return data_.get()[idx];
     }
     float value = 0.0f;
-    check_cuda(cudaMemcpy(&value, data_.get() + idx, sizeof(float), cudaMemcpyDeviceToHost));
+    cuda_ops::check_cuda(cudaMemcpy(&value, data_.get() + idx, sizeof(float), cudaMemcpyDeviceToHost));
     return value;
 }
 
@@ -186,9 +188,9 @@ void Tensor::set(const std::vector<int>& indices, float value) {
     size_t idx = flatten_index(indices);
     if (device_ == DeviceType::CPU) {
         data_.get()[idx] = value;
-        return;
+    } else {
+        cuda_ops::check_cuda(cudaMemcpy(data_.get() + idx, &value, sizeof(float), cudaMemcpyHostToDevice));
     }
-    check_cuda(cudaMemcpy(data_.get() + idx, &value, sizeof(float), cudaMemcpyHostToDevice));
 }
 
 std::string Tensor::to_string() const {
@@ -200,20 +202,20 @@ std::string Tensor::to_string() const {
     }
     buffer << "], device=" << (device_ == DeviceType::CUDA ? "CUDA" : "CPU") << ", values=[";
     Tensor host_view = (device_ == DeviceType::CUDA ? to(DeviceType::CPU) : *this);
-    size_t display = std::min<size_t>(host_view.numel(), 8);
+    size_t display = std::min<size_t>(host_view.numel_, 8);
     for (size_t i = 0; i < display; ++i) {
         buffer << std::fixed << std::setprecision(4) << host_view.data_.get()[i];
         if (i + 1 < display) buffer << ", ";
     }
-    if (host_view.numel() > display) buffer << ", ...";
-    buffer << "])";
+    if (host_view.numel_ > display) buffer << ", ...";
+    buffer << "]";
     return buffer.str();
 }
 
 void Tensor::save(const std::string& path) const {
     Tensor host_view = (device_ == DeviceType::CUDA ? to(DeviceType::CPU) : *this);
     std::ofstream output(path, std::ios::binary);
-    output << static_cast<int>(shape_.size());
+    output << static_cast<int>(shape_.size()) << " ";
     for (int dim : shape_) {
         output << dim << " ";
     }
@@ -235,39 +237,69 @@ Tensor Tensor::load(const std::string& path, DeviceType device, bool requires_gr
     return Tensor::fromVector(buffer, shape, device, requires_grad);
 }
 
-void Tensor::zero_grad() {
-    if (!requires_grad_) return;
-    grad_ = Tensor::zeros(shape_, device_, false);
+Tensor& Tensor::grad() {
+    if (!grad_) {
+        grad_ = std::make_shared<Tensor>(zeros(shape_, device_, false));
+    }
+    return *grad_;
 }
 
-void Tensor::build_topo(std::vector<Tensor*>& topo, std::unordered_set<Tensor*>&) {
-    topo.push_back(this);
-    if (!grad_op_) return;
-    for (auto& parent : grad_op_->parents) {
-        parent.build_topo(topo, std::unordered_set<Tensor*>());
+const Tensor& Tensor::grad() const {
+    assert(grad_);
+    return *grad_;
+}
+
+void Tensor::zero_grad() {
+    if (!requires_grad_) return;
+    grad_ = std::make_shared<Tensor>(zeros(shape_, device_, false));
+}
+
+void Tensor::build_topo(std::vector<Tensor>& topo, std::unordered_set<GradOp*>& visited) const {
+    if (!grad_op_ || !visited.insert(grad_op_.get()).second) {
+        return;
     }
+    for (auto& parent : grad_op_->parents) {
+        parent.build_topo(topo, visited);
+    }
+    topo.push_back(*this);
 }
 
 void Tensor::add_grad(const Tensor& grad) {
-    if (grad_.numel_ == 0) {
-        grad_ = grad.clone();
+    Tensor actual_grad = grad.device_ == device_ ? grad : grad.to(device_);
+    if (!grad_) {
+        grad_ = std::make_shared<Tensor>(actual_grad);
         return;
     }
-    grad_ = grad_ + grad;
+    if (grad_->numel_ == 0) {
+        *grad_ = actual_grad;
+        return;
+    }
+    assert(grad_->numel_ == actual_grad.numel_);
+    if (device_ == DeviceType::CPU) {
+        for (size_t i = 0; i < numel_; ++i) {
+            grad_->data_.get()[i] += actual_grad.data_.get()[i];
+        }
+    } else {
+        Tensor grad_cpu = grad_->to(DeviceType::CPU);
+        Tensor actual_cpu = actual_grad.to(DeviceType::CPU);
+        for (size_t i = 0; i < numel_; ++i) {
+            grad_cpu.data_.get()[i] += actual_cpu.data_.get()[i];
+        }
+        *grad_ = grad_cpu.to(device_);
+    }
 }
 
 void Tensor::backward() {
     if (!requires_grad_) return;
-    if (grad_.numel_ == 0) {
-        grad_ = Tensor::ones(shape_, device_, false);
+    if (!grad_ || grad_->numel_ == 0) {
+        grad_ = std::make_shared<Tensor>(ones(shape_, device_, false));
     }
-    std::vector<Tensor*> topo;
-    std::unordered_set<Tensor*> visited;
+    std::vector<Tensor> topo;
+    std::unordered_set<GradOp*> visited;
     build_topo(topo, visited);
     for (auto it = topo.rbegin(); it != topo.rend(); ++it) {
-        Tensor* current = *it;
-        if (current->grad_op_) {
-            current->grad_op_->backward(*current);
+        if (it->grad_op_) {
+            it->grad_op_->backward();
         }
     }
 }
@@ -278,31 +310,37 @@ Tensor Tensor::clone() const {
         if (device_ == DeviceType::CPU) {
             std::memcpy(result.data_.get(), data_.get(), numel_ * sizeof(float));
         } else {
-            check_cuda(cudaMemcpy(result.data_.get(), data_.get(), numel_ * sizeof(float), cudaMemcpyDeviceToDevice));
+            cuda_ops::check_cuda(cudaMemcpy(result.data_.get(), data_.get(), numel_ * sizeof(float), cudaMemcpyDeviceToDevice));
         }
     }
     return result;
 }
 
+static void copy_elementwise(const Tensor& a, const Tensor& b, Tensor& out, const std::function<float(float, float)>& op) {
+    assert(a.numel_ == b.numel_);
+    for (size_t i = 0; i < a.numel_; ++i) {
+        out.data_.get()[i] = op(a.data_.get()[i], b.data_.get()[i]);
+    }
+}
+
 Tensor Tensor::operator+(const Tensor& other) const {
     assert(shape_ == other.shape_);
+    assert(device_ == other.device_);
     Tensor out(shape_, device_, requires_grad_ || other.requires_grad_);
     if (device_ == DeviceType::CUDA) {
         cuda_ops::add(*this, other, out);
     } else {
-        for (size_t i = 0; i < numel_; ++i) {
-            out.data_.get()[i] = data_.get()[i] + other.data_.get()[i];
-        }
+        copy_elementwise(*this, other, out, [](float x, float y) { return x + y; });
     }
     if (out.requires_grad_) {
         out.grad_op_ = std::make_shared<GradOp>();
         out.grad_op_->parents = {*this, other};
-        out.grad_op_->backward = [this, other](Tensor& self) {
-            if (this->requires_grad_) {
-                this->add_grad(self.grad_);
+        out.grad_op_->backward = [lhs = *this, rhs = other, out]() mutable {
+            if (lhs.requires_grad_) {
+                lhs.add_grad(out.grad());
             }
-            if (other.requires_grad_) {
-                other.add_grad(self.grad_);
+            if (rhs.requires_grad_) {
+                rhs.add_grad(out.grad());
             }
         };
     }
@@ -311,23 +349,22 @@ Tensor Tensor::operator+(const Tensor& other) const {
 
 Tensor Tensor::operator-(const Tensor& other) const {
     assert(shape_ == other.shape_);
+    assert(device_ == other.device_);
     Tensor out(shape_, device_, requires_grad_ || other.requires_grad_);
     if (device_ == DeviceType::CUDA) {
         cuda_ops::subtract(*this, other, out);
     } else {
-        for (size_t i = 0; i < numel_; ++i) {
-            out.data_.get()[i] = data_.get()[i] - other.data_.get()[i];
-        }
+        copy_elementwise(*this, other, out, [](float x, float y) { return x - y; });
     }
     if (out.requires_grad_) {
         out.grad_op_ = std::make_shared<GradOp>();
         out.grad_op_->parents = {*this, other};
-        out.grad_op_->backward = [this, other](Tensor& self) {
-            if (this->requires_grad_) {
-                this->add_grad(self.grad_);
+        out.grad_op_->backward = [lhs = *this, rhs = other, out]() mutable {
+            if (lhs.requires_grad_) {
+                lhs.add_grad(out.grad());
             }
-            if (other.requires_grad_) {
-                other.add_grad(self.grad_ * -1.0f);
+            if (rhs.requires_grad_) {
+                rhs.add_grad(out.grad() * -1.0f);
             }
         };
     }
@@ -336,23 +373,22 @@ Tensor Tensor::operator-(const Tensor& other) const {
 
 Tensor Tensor::operator*(const Tensor& other) const {
     assert(shape_ == other.shape_);
+    assert(device_ == other.device_);
     Tensor out(shape_, device_, requires_grad_ || other.requires_grad_);
     if (device_ == DeviceType::CUDA) {
         cuda_ops::multiply(*this, other, out);
     } else {
-        for (size_t i = 0; i < numel_; ++i) {
-            out.data_.get()[i] = data_.get()[i] * other.data_.get()[i];
-        }
+        copy_elementwise(*this, other, out, [](float x, float y) { return x * y; });
     }
     if (out.requires_grad_) {
         out.grad_op_ = std::make_shared<GradOp>();
         out.grad_op_->parents = {*this, other};
-        out.grad_op_->backward = [this, other](Tensor& self) {
-            if (this->requires_grad_) {
-                this->add_grad(self.grad_ * other);
+        out.grad_op_->backward = [lhs = *this, rhs = other, out]() mutable {
+            if (lhs.requires_grad_) {
+                lhs.add_grad(out.grad() * rhs);
             }
-            if (other.requires_grad_) {
-                other.add_grad(self.grad_ * *this);
+            if (rhs.requires_grad_) {
+                rhs.add_grad(out.grad() * lhs);
             }
         };
     }
@@ -361,25 +397,24 @@ Tensor Tensor::operator*(const Tensor& other) const {
 
 Tensor Tensor::operator/(const Tensor& other) const {
     assert(shape_ == other.shape_);
+    assert(device_ == other.device_);
     Tensor out(shape_, device_, requires_grad_ || other.requires_grad_);
     if (device_ == DeviceType::CUDA) {
         cuda_ops::divide(*this, other, out);
     } else {
-        for (size_t i = 0; i < numel_; ++i) {
-            out.data_.get()[i] = data_.get()[i] / other.data_.get()[i];
-        }
+        copy_elementwise(*this, other, out, [](float x, float y) { return x / y; });
     }
     if (out.requires_grad_) {
         out.grad_op_ = std::make_shared<GradOp>();
         out.grad_op_->parents = {*this, other};
-        out.grad_op_->backward = [this, other](Tensor& self) {
-            if (this->requires_grad_) {
-                this->add_grad(self.grad_ / other);
+        out.grad_op_->backward = [lhs = *this, rhs = other, out]() mutable {
+            if (lhs.requires_grad_) {
+                lhs.add_grad(out.grad() / rhs);
             }
-            if (other.requires_grad_) {
-                Tensor numerator = *this * self.grad_ * -1.0f;
-                Tensor denominator = other * other;
-                other.add_grad(numerator / denominator);
+            if (rhs.requires_grad_) {
+                Tensor numerator = lhs * out.grad() * -1.0f;
+                Tensor denominator = rhs * rhs;
+                rhs.add_grad(numerator / denominator);
             }
         };
     }
@@ -389,12 +424,20 @@ Tensor Tensor::operator/(const Tensor& other) const {
 Tensor Tensor::operator+(float scalar) const {
     Tensor out(shape_, device_, requires_grad_);
     if (device_ == DeviceType::CUDA) {
-        Tensor bias = Tensor::ones(shape_, device_, false) * scalar;
-        out = *this + bias;
+        cuda_ops::add_scalar(*this, out, scalar);
     } else {
         for (size_t i = 0; i < numel_; ++i) {
             out.data_.get()[i] = data_.get()[i] + scalar;
         }
+    }
+    if (out.requires_grad_) {
+        out.grad_op_ = std::make_shared<GradOp>();
+        out.grad_op_->parents = {*this};
+        out.grad_op_->backward = [lhs = *this, out]() mutable {
+            if (lhs.requires_grad_) {
+                lhs.add_grad(out.grad());
+            }
+        };
     }
     return out;
 }
@@ -406,17 +449,20 @@ Tensor Tensor::operator-(float scalar) const {
 Tensor Tensor::operator*(float scalar) const {
     Tensor out(shape_, device_, requires_grad_);
     if (device_ == DeviceType::CUDA) {
-        Tensor scaling = Tensor::ones(shape_, device_, false);
-        for (size_t i = 0; i < numel_; ++i) {
-            if (device_ == DeviceType::CPU) {
-                scaling.data_.get()[i] = scalar;
-            }
-        }
-        out = *this * scaling;
+        cuda_ops::multiply_scalar(*this, out, scalar);
     } else {
         for (size_t i = 0; i < numel_; ++i) {
             out.data_.get()[i] = data_.get()[i] * scalar;
         }
+    }
+    if (out.requires_grad_) {
+        out.grad_op_ = std::make_shared<GradOp>();
+        out.grad_op_->parents = {*this};
+        out.grad_op_->backward = [lhs = *this, scalar, out]() mutable {
+            if (lhs.requires_grad_) {
+                lhs.add_grad(out.grad() * scalar);
+            }
+        };
     }
     return out;
 }
@@ -429,8 +475,8 @@ Tensor Tensor::operator/(float scalar) const {
 Tensor Tensor::matmul(const Tensor& other) const {
     assert(shape_.size() == 2 && other.shape_.size() == 2);
     assert(shape_[1] == other.shape_[0]);
-    std::vector<int> shape = {shape_[0], other.shape_[1]};
-    Tensor out(shape, device_, requires_grad_ || other.requires_grad_);
+    assert(device_ == other.device_);
+    Tensor out({shape_[0], other.shape_[1]}, device_, requires_grad_ || other.requires_grad_);
     if (device_ == DeviceType::CUDA) {
         cuda_ops::matmul(*this, other, out);
     } else {
@@ -450,14 +496,12 @@ Tensor Tensor::matmul(const Tensor& other) const {
     if (out.requires_grad_) {
         out.grad_op_ = std::make_shared<GradOp>();
         out.grad_op_->parents = {*this, other};
-        out.grad_op_->backward = [this, other](Tensor& self) {
-            if (this->requires_grad_) {
-                Tensor grad_a = self.grad_.matmul(other.transpose());
-                this->add_grad(grad_a);
+        out.grad_op_->backward = [lhs = *this, rhs = other, out]() mutable {
+            if (lhs.requires_grad_) {
+                lhs.add_grad(out.grad().matmul(rhs.transpose()));
             }
-            if (other.requires_grad_) {
-                Tensor grad_b = this->transpose().matmul(self.grad_);
-                other.add_grad(grad_b);
+            if (rhs.requires_grad_) {
+                rhs.add_grad(lhs.transpose().matmul(out.grad()));
             }
         };
     }
@@ -480,9 +524,9 @@ Tensor Tensor::transpose(int dim0, int dim1) const {
     if (out.requires_grad_) {
         out.grad_op_ = std::make_shared<GradOp>();
         out.grad_op_->parents = {*this};
-        out.grad_op_->backward = [this](Tensor& self) {
-            if (this->requires_grad_) {
-                this->add_grad(self.grad_.transpose());
+        out.grad_op_->backward = [lhs = *this, out]() mutable {
+            if (lhs.requires_grad_) {
+                lhs.add_grad(out.grad().transpose());
             }
         };
     }
@@ -490,28 +534,36 @@ Tensor Tensor::transpose(int dim0, int dim1) const {
 }
 
 Tensor Tensor::sum(int axis) const {
-    if (axis == -1) axis = (int)shape_.size() - 1;
-    assert(axis >= 0 && axis < (int)shape_.size());
+    if (axis == -1) axis = static_cast<int>(shape_.size()) - 1;
+    assert(axis >= 0 && axis < static_cast<int>(shape_.size()));
     if (shape_.size() == 1) {
         float accumulator = 0.0f;
         if (device_ == DeviceType::CPU) {
             for (size_t i = 0; i < numel_; ++i) {
                 accumulator += data_.get()[i];
             }
-            Tensor result({}, device_, requires_grad_);
-            result.data_ = std::shared_ptr<float>(new float[1], std::default_delete<float[]>());
-            result.data_.get()[0] = accumulator;
-            return result;
         } else {
             Tensor host = to(DeviceType::CPU);
             for (size_t i = 0; i < numel_; ++i) {
                 accumulator += host.data_.get()[i];
             }
-            Tensor result({}, DeviceType::CPU, requires_grad_);
-            result.data_ = std::shared_ptr<float>(new float[1], std::default_delete<float[]>());
-            result.data_.get()[0] = accumulator;
-            return result;
         }
+        Tensor result({}, device_, requires_grad_);
+        if (device_ == DeviceType::CPU) {
+            result.data_.get()[0] = accumulator;
+        } else {
+            cuda_ops::check_cuda(cudaMemcpy(result.data_.get(), &accumulator, sizeof(float), cudaMemcpyHostToDevice));
+        }
+        if (result.requires_grad_) {
+            result.grad_op_ = std::make_shared<GradOp>();
+            result.grad_op_->parents = {*this};
+            result.grad_op_->backward = [lhs = *this, result]() mutable {
+                if (lhs.requires_grad_) {
+                    lhs.add_grad(Tensor::ones(lhs.shape_, lhs.device_, false) * result.grad());
+                }
+            };
+        }
+        return result;
     }
     assert(shape_.size() == 2);
     std::vector<int> out_shape = shape_;
@@ -543,28 +595,26 @@ Tensor Tensor::sum(int axis) const {
     if (out.requires_grad_) {
         out.grad_op_ = std::make_shared<GradOp>();
         out.grad_op_->parents = {*this};
-        out.grad_op_->backward = [this, axis](Tensor& self) {
-            if (this->requires_grad_) {
-                Tensor expanded = self.grad_;
+        out.grad_op_->backward = [lhs = *this, out, axis]() mutable {
+            if (lhs.requires_grad_) {
+                Tensor grad_output = out.grad();
+                Tensor grads = Tensor::zeros(lhs.shape_, lhs.device_, false);
                 if (axis == 1) {
-                    expanded.reshape({shape_[0], 1});
-                    Tensor grads = Tensor::zeros(shape_, device_, false);
-                    for (int i = 0; i < shape_[0]; ++i) {
-                        for (int j = 0; j < shape_[1]; ++j) {
-                            grads.data_.get()[i * shape_[1] + j] = expanded.data_.get()[i];
+                    for (int i = 0; i < lhs.shape_[0]; ++i) {
+                        float value = grad_output.data_.get()[i];
+                        for (int j = 0; j < lhs.shape_[1]; ++j) {
+                            grads.data_.get()[i * lhs.shape_[1] + j] = value;
                         }
                     }
-                    this->add_grad(grads);
                 } else {
-                    expanded.reshape({1, shape_[1]});
-                    Tensor grads = Tensor::zeros(shape_, device_, false);
-                    for (int i = 0; i < shape_[0]; ++i) {
-                        for (int j = 0; j < shape_[1]; ++j) {
-                            grads.data_.get()[i * shape_[1] + j] = expanded.data_.get()[j];
+                    for (int j = 0; j < lhs.shape_[1]; ++j) {
+                        float value = grad_output.data_.get()[j];
+                        for (int i = 0; i < lhs.shape_[0]; ++i) {
+                            grads.data_.get()[i * lhs.shape_[1] + j] = value;
                         }
                     }
-                    this->add_grad(grads);
                 }
+                lhs.add_grad(grads);
             }
         };
     }
@@ -589,13 +639,14 @@ Tensor Tensor::relu() const {
     if (out.requires_grad_) {
         out.grad_op_ = std::make_shared<GradOp>();
         out.grad_op_->parents = {*this};
-        out.grad_op_->backward = [this](Tensor& self) {
-            if (this->requires_grad_) {
-                Tensor grads = Tensor::zeros(shape_, device_, false);
-                for (size_t i = 0; i < numel_; ++i) {
-                    grads.data_.get()[i] = (data_.get()[i] > 0.0f ? self.grad_.data_.get()[i] : 0.0f);
+        out.grad_op_->backward = [lhs = *this, out]() mutable {
+            if (lhs.requires_grad_) {
+                Tensor grad_output = out.grad();
+                Tensor grads = Tensor::zeros(lhs.shape_, lhs.device_, false);
+                for (size_t i = 0; i < lhs.numel_; ++i) {
+                    grads.data_.get()[i] = (lhs.data_.get()[i] > 0.0f ? grad_output.data_.get()[i] : 0.0f);
                 }
-                this->add_grad(grads);
+                lhs.add_grad(grads);
             }
         };
     }
@@ -614,15 +665,15 @@ Tensor Tensor::sigmoid() const {
     if (out.requires_grad_) {
         out.grad_op_ = std::make_shared<GradOp>();
         out.grad_op_->parents = {*this};
-        out.grad_op_->backward = [this](Tensor& self) {
-            if (this->requires_grad_) {
-                Tensor sigma = self;
-                Tensor grads = Tensor::zeros(shape_, device_, false);
-                for (size_t i = 0; i < numel_; ++i) {
-                    float s = sigma.data_.get()[i];
-                    grads.data_.get()[i] = self.grad_.data_.get()[i] * s * (1.0f - s);
+        out.grad_op_->backward = [lhs = *this, out]() mutable {
+            if (lhs.requires_grad_) {
+                Tensor grad_output = out.grad();
+                Tensor grads = Tensor::zeros(lhs.shape_, lhs.device_, false);
+                for (size_t i = 0; i < lhs.numel_; ++i) {
+                    float s = out.data_.get()[i];
+                    grads.data_.get()[i] = grad_output.data_.get()[i] * s * (1.0f - s);
                 }
-                this->add_grad(grads);
+                lhs.add_grad(grads);
             }
         };
     }
@@ -641,14 +692,15 @@ Tensor Tensor::tanh() const {
     if (out.requires_grad_) {
         out.grad_op_ = std::make_shared<GradOp>();
         out.grad_op_->parents = {*this};
-        out.grad_op_->backward = [this](Tensor& self) {
-            if (this->requires_grad_) {
-                Tensor grads = Tensor::zeros(shape_, device_, false);
-                for (size_t i = 0; i < numel_; ++i) {
-                    float t = self.data_.get()[i];
-                    grads.data_.get()[i] = self.grad_.data_.get()[i] * (1.0f - t * t);
+        out.grad_op_->backward = [lhs = *this, out]() mutable {
+            if (lhs.requires_grad_) {
+                Tensor grad_output = out.grad();
+                Tensor grads = Tensor::zeros(lhs.shape_, lhs.device_, false);
+                for (size_t i = 0; i < lhs.numel_; ++i) {
+                    float t = out.data_.get()[i];
+                    grads.data_.get()[i] = grad_output.data_.get()[i] * (1.0f - t * t);
                 }
-                this->add_grad(grads);
+                lhs.add_grad(grads);
             }
         };
     }
@@ -667,13 +719,14 @@ Tensor Tensor::log() const {
     if (out.requires_grad_) {
         out.grad_op_ = std::make_shared<GradOp>();
         out.grad_op_->parents = {*this};
-        out.grad_op_->backward = [this](Tensor& self) {
-            if (this->requires_grad_) {
-                Tensor grads = Tensor::zeros(shape_, device_, false);
-                for (size_t i = 0; i < numel_; ++i) {
-                    grads.data_.get()[i] = self.grad_.data_.get()[i] / std::max(this->data_.get()[i], 1e-20f);
+        out.grad_op_->backward = [lhs = *this, out]() mutable {
+            if (lhs.requires_grad_) {
+                Tensor grad_output = out.grad();
+                Tensor grads = Tensor::zeros(lhs.shape_, lhs.device_, false);
+                for (size_t i = 0; i < lhs.numel_; ++i) {
+                    grads.data_.get()[i] = grad_output.data_.get()[i] / std::max(lhs.data_.get()[i], 1e-20f);
                 }
-                this->add_grad(grads);
+                lhs.add_grad(grads);
             }
         };
     }
@@ -706,21 +759,22 @@ Tensor Tensor::softmax(int axis) const {
     if (out.requires_grad_) {
         out.grad_op_ = std::make_shared<GradOp>();
         out.grad_op_->parents = {*this};
-        out.grad_op_->backward = [this](Tensor& self) {
-            if (this->requires_grad_) {
-                Tensor grad_input = Tensor::zeros(shape_, device_, false);
-                int rows = shape_[0];
-                int cols = shape_[1];
+        out.grad_op_->backward = [lhs = *this, out]() mutable {
+            if (lhs.requires_grad_) {
+                Tensor grad_output = out.grad();
+                Tensor grads = Tensor::zeros(lhs.shape_, lhs.device_, false);
+                int rows = lhs.shape_[0];
+                int cols = lhs.shape_[1];
                 for (int i = 0; i < rows; ++i) {
                     float dot = 0.0f;
                     for (int j = 0; j < cols; ++j) {
-                        dot += self.data_.get()[i * cols + j] * self.grad_.data_.get()[i * cols + j];
+                        dot += out.data_.get()[i * cols + j] * grad_output.data_.get()[i * cols + j];
                     }
                     for (int j = 0; j < cols; ++j) {
-                        grad_input.data_.get()[i * cols + j] = self.data_.get()[i * cols + j] * (self.grad_.data_.get()[i * cols + j] - dot);
+                        grads.data_.get()[i * cols + j] = out.data_.get()[i * cols + j] * (grad_output.data_.get()[i * cols + j] - dot);
                     }
                 }
-                this->add_grad(grad_input);
+                lhs.add_grad(grads);
             }
         };
     }

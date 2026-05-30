@@ -1,4 +1,5 @@
 #include "autograd/autograd.h"
+#include <cassert>
 #include <cmath>
 
 namespace minidl {

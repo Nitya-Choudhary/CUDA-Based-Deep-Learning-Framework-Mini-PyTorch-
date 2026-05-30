@@ -1,4 +1,5 @@
 #include "datasets/mnist.h"
+#include "cuda/cuda_utils.h"
 #include <cuda_runtime.h>
 #include <fstream>
 #include <iostream>
@@ -93,8 +94,8 @@ std::pair<Tensor, Tensor> MNISTDataset::next_batch(int batch_size) {
         std::vector<float> local_labels(size * labels_.shape()[1]);
         std::memcpy(local_images.data(), images_.data() + position_ * images_.shape()[1], size * images_.shape()[1] * sizeof(float));
         std::memcpy(local_labels.data(), labels_.data() + position_ * labels_.shape()[1], size * labels_.shape()[1] * sizeof(float));
-        check_cuda(cudaMemcpy(batch_images.data(), local_images.data(), size * images_.shape()[1] * sizeof(float), cudaMemcpyHostToDevice));
-        check_cuda(cudaMemcpy(batch_labels.data(), local_labels.data(), size * labels_.shape()[1] * sizeof(float), cudaMemcpyHostToDevice));
+        cuda_ops::check_cuda(cudaMemcpy(batch_images.data(), local_images.data(), size * images_.shape()[1] * sizeof(float), cudaMemcpyHostToDevice));
+        cuda_ops::check_cuda(cudaMemcpy(batch_labels.data(), local_labels.data(), size * labels_.shape()[1] * sizeof(float), cudaMemcpyHostToDevice));
     }
 
     position_ += size;
